@@ -88,6 +88,49 @@ type Job struct {
 	CreatedAt  time.Time         `json:"created_at"`
 	StartedAt  *time.Time        `json:"started_at,omitempty"`
 	FinishedAt *time.Time        `json:"finished_at,omitempty"`
+
+	// RunAt schedules the job for future dispatch. Zero value means
+	// "eligible immediately". Jobs with a future RunAt are held by the
+	// Scheduler and only handed to a worker once that time has passed.
+	RunAt time.Time `json:"run_at,omitempty"`
+
+	// Timeout bounds how long a single execution attempt may run before
+	// it is cancelled and treated as a failed attempt (subject to the
+	// same retry/backoff policy as any other handler error). Zero means
+	// no per-attempt deadline is enforced.
+	Timeout time.Duration `json:"timeout_ns,omitempty"`
+
+	// DedupeKey, if set, suppresses new enqueues carrying the same key
+	// while a prior job with that key is still within DedupeWindow of
+	// its own enqueue time. Empty key means no deduplication.
+	DedupeKey    string        `json:"dedupe_key,omitempty"`
+	DedupeWindow time.Duration `json:"dedupe_window_ns,omitempty"`
+
+	// WebhookURL, if set, receives a POST with the job's final status
+	// once it reaches Done or Failed. Best-effort — delivery failures
+	// are logged, not retried, and never affect the job's own status.
+	WebhookURL string `json:"webhook_url,omitempty"`
+
+	// OnSuccess/OnFailure describe a follow-up job to enqueue once this
+	// job finishes. Only one fires per job, matching its actual outcome.
+	OnSuccess *JobTemplate `json:"on_success,omitempty"`
+	OnFailure *JobTemplate `json:"on_failure,omitempty"`
+}
+
+// JobTemplate is a lightweight description of a job to enqueue later —
+// used for chaining (Job.OnSuccess / Job.OnFailure) instead of embedding
+// a full *Job, since a template has no ID, status, or timestamps of its
+// own until it's actually turned into one.
+type JobTemplate struct {
+	Type       string            `json:"type"`
+	Payload    map[string]string `json:"payload"`
+	Priority   JobPriority       `json:"priority"`
+	MaxRetries int               `json:"max_retries"`
+}
+
+// ToJob turns a template into a freshly-minted, enqueue-ready Job.
+func (t *JobTemplate) ToJob() *Job {
+	return NewJob(t.Type, t.Payload, t.Priority, t.MaxRetries)
 }
 
 func NewJob(jobType string, payload map[string]string, priority JobPriority, maxRetries int) *Job {
@@ -101,4 +144,10 @@ func NewJob(jobType string, payload map[string]string, priority JobPriority, max
 		MaxRetries: maxRetries,
 		CreatedAt:  now,
 	}
+}
+
+// IsDue reports whether the job's scheduled time has arrived (or it was
+// never delayed in the first place).
+func (j *Job) IsDue(now time.Time) bool {
+	return j.RunAt.IsZero() || !j.RunAt.After(now)
 }

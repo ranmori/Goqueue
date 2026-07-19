@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,26 @@ import (
 type JobFilter struct {
 	Type   string
 	Status *JobStatus
+
+	// Limit/Offset paginate List results. Limit <= 0 means "no limit".
+	Limit  int
+	Offset int
+}
+
+// DeadLetter records a job that exhausted its retries. Kept separately
+// from the main jobs table/map so a growing backlog of permanent
+// failures doesn't clutter normal job listings, while still being fully
+// inspectable and replayable.
+type DeadLetter struct {
+	ID                  string            `json:"id"`
+	JobID               string            `json:"job_id"`
+	Type                string            `json:"type"`
+	Payload             map[string]string `json:"payload"`
+	Priority            JobPriority       `json:"priority"`
+	MaxRetries          int               `json:"max_retries"`
+	Error               string            `json:"error"`
+	FailedAt            time.Time         `json:"failed_at"`
+	OriginallyCreatedAt time.Time         `json:"originally_created_at"`
 }
 
 type Store interface {
@@ -24,15 +45,24 @@ type Store interface {
 	List(filter JobFilter) ([]*Job, error)
 	Cancel(id string) error
 	Stats() (map[string]int, error)
+
+	SaveDeadLetter(entry *DeadLetter) error
+	ListDeadLetters() ([]*DeadLetter, error)
+	DeleteDeadLetter(id string) error
 }
 
 type InMemoryStore struct {
-	mu   sync.RWMutex
-	jobs map[string]*Job
+	mu          sync.RWMutex
+	jobs        map[string]*Job
+	deadLetters map[string]*DeadLetter
+	dlqSeq      int64
 }
 
 func NewInMemoryStore() *InMemoryStore {
-	return &InMemoryStore{jobs: make(map[string]*Job)}
+	return &InMemoryStore{
+		jobs:        make(map[string]*Job),
+		deadLetters: make(map[string]*DeadLetter),
+	}
 }
 
 func (s *InMemoryStore) Save(job *Job) error {
@@ -75,6 +105,23 @@ func (s *InMemoryStore) List(filter JobFilter) ([]*Job, error) {
 		}
 		jobs = append(jobs, job)
 	}
+
+	// Match PostgresStore's ORDER BY created_at DESC so pagination behaves
+	// the same regardless of which Store implementation is in use.
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].CreatedAt.After(jobs[j].CreatedAt)
+	})
+
+	if filter.Offset > 0 {
+		if filter.Offset >= len(jobs) {
+			return []*Job{}, nil
+		}
+		jobs = jobs[filter.Offset:]
+	}
+	if filter.Limit > 0 && filter.Limit < len(jobs) {
+		jobs = jobs[:filter.Limit]
+	}
+
 	return jobs, nil
 }
 
@@ -107,6 +154,38 @@ func (s *InMemoryStore) Stats() (map[string]int, error) {
 		stats[job.Status.String()]++
 	}
 	return stats, nil
+}
+
+func (s *InMemoryStore) SaveDeadLetter(entry *DeadLetter) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dlqSeq++
+	if entry.ID == "" {
+		entry.ID = fmt.Sprintf("dlq_%d", s.dlqSeq)
+	}
+	s.deadLetters[entry.ID] = entry
+	return nil
+}
+
+func (s *InMemoryStore) ListDeadLetters() ([]*DeadLetter, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*DeadLetter, 0, len(s.deadLetters))
+	for _, d := range s.deadLetters {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FailedAt.After(out[j].FailedAt) })
+	return out, nil
+}
+
+func (s *InMemoryStore) DeleteDeadLetter(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.deadLetters[id]; !exists {
+		return fmt.Errorf("dead letter %s not found", id)
+	}
+	delete(s.deadLetters, id)
+	return nil
 }
 
 type PostgresStore struct {
@@ -150,6 +229,23 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TIMESTAMPTZ NOT NULL,
     started_at TIMESTAMPTZ NULL,
     finished_at TIMESTAMPTZ NULL
+)
+`)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB NULL,
+    priority INT NOT NULL,
+    max_retries INT NOT NULL,
+    error TEXT NOT NULL,
+    failed_at TIMESTAMPTZ NOT NULL,
+    originally_created_at TIMESTAMPTZ NOT NULL
 )
 `)
 	return err
@@ -304,6 +400,13 @@ FROM jobs`
 	}
 	query += " ORDER BY created_at DESC"
 
+	if filter.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", filter.Limit)
+	}
+	if filter.Offset > 0 {
+		query += fmt.Sprintf(" OFFSET %d", filter.Offset)
+	}
+
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -367,4 +470,64 @@ GROUP BY status
 		stats[JobStatus(status).String()] = count
 	}
 	return stats, rows.Err()
+}
+
+func (s *PostgresStore) SaveDeadLetter(entry *DeadLetter) error {
+	payload, err := json.Marshal(entry.Payload)
+	if err != nil {
+		return err
+	}
+	if entry.ID == "" {
+		entry.ID = fmt.Sprintf("dlq_%s", entry.JobID)
+	}
+	_, err = s.db.Exec(`
+INSERT INTO dead_letters (
+    id, job_id, type, payload, priority, max_retries, error, failed_at, originally_created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (id) DO NOTHING
+`, entry.ID, entry.JobID, entry.Type, payload, int(entry.Priority), entry.MaxRetries, entry.Error, entry.FailedAt, entry.OriginallyCreatedAt)
+	return err
+}
+
+func (s *PostgresStore) ListDeadLetters() ([]*DeadLetter, error) {
+	rows, err := s.db.Query(`
+SELECT id, job_id, type, payload, priority, max_retries, error, failed_at, originally_created_at
+FROM dead_letters
+ORDER BY failed_at DESC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*DeadLetter, 0)
+	for rows.Next() {
+		var d DeadLetter
+		var payloadBytes []byte
+		var priority int
+		if err := rows.Scan(&d.ID, &d.JobID, &d.Type, &payloadBytes, &priority, &d.MaxRetries, &d.Error, &d.FailedAt, &d.OriginallyCreatedAt); err != nil {
+			return nil, err
+		}
+		d.Priority = JobPriority(priority)
+		if len(payloadBytes) > 0 {
+			_ = json.Unmarshal(payloadBytes, &d.Payload)
+		}
+		out = append(out, &d)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) DeleteDeadLetter(id string) error {
+	result, err := s.db.Exec(`DELETE FROM dead_letters WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("dead letter %s not found", id)
+	}
+	return nil
 }

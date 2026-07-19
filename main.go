@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
@@ -15,24 +15,33 @@ import (
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	var store Store
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL != "" {
 		pgStore, err := NewPostgresStore(databaseURL)
 		if err != nil {
-			log.Fatalf("failed to connect to postgres: %v", err)
+			logger.Error("failed to connect to postgres", "error", err)
+			os.Exit(1)
 		}
 		store = pgStore
-		log.Println("✅ Using PostgreSQL store")
+		logger.Info("using PostgreSQL store")
 	} else {
 		store = NewInMemoryStore()
-		log.Println("⚠️  DATABASE_URL is not set. Using in-memory persistence only.")
+		logger.Warn("DATABASE_URL is not set, using in-memory persistence only")
 	}
 
 	queue := NewQueue(store, 5)
+	queue.SetLogger(logger)
+
+	queue.SetConcurrencyLimit("email", 10)
 
 	queue.RegisterHandler("email", func(ctx context.Context, job *Job) error {
-		log.Printf("📧 Sending email to %s", job.Payload["to"])
+		logger.Info("sending email", "job_id", job.ID, "to", job.Payload["to"])
 		select {
 		case <-time.After(time.Duration(rand.Intn(2000)) * time.Millisecond):
 			return nil
@@ -42,7 +51,7 @@ func main() {
 	})
 
 	queue.RegisterHandler("webhook", func(ctx context.Context, job *Job) error {
-		log.Printf("🌐 Firing webhook to %s", job.Payload["url"])
+		logger.Info("firing webhook", "job_id", job.ID, "url", job.Payload["url"])
 		select {
 		case <-time.After(500 * time.Millisecond):
 		case <-ctx.Done():
@@ -55,7 +64,7 @@ func main() {
 	})
 
 	queue.RegisterHandler("report", func(ctx context.Context, job *Job) error {
-		log.Printf("📊 Generating report: %s", job.Payload["report_name"])
+		logger.Info("generating report", "job_id", job.ID, "report_name", job.Payload["report_name"])
 		select {
 		case <-time.After(3 * time.Second):
 			return nil
@@ -63,6 +72,10 @@ func main() {
 			return ctx.Err()
 		}
 	})
+
+	scheduler := NewScheduler(queue.release, 200*time.Millisecond)
+	queue.SetScheduler(scheduler)
+	scheduler.Start()
 
 	queue.Start()
 
@@ -72,6 +85,9 @@ func main() {
 	mux.HandleFunc("/jobs/", handlers.jobHandler)
 	mux.HandleFunc("/jobs", handlers.jobsHandler)
 	mux.HandleFunc("/stats", handlers.getStats)
+	mux.HandleFunc("/dlq", handlers.dlqHandler)
+	mux.HandleFunc("/dlq/", handlers.dlqReplayHandler)
+	mux.HandleFunc("/metrics", queue.Metrics().ServeHTTP)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -83,21 +99,23 @@ func main() {
 
 	go func() {
 		<-stop
-		log.Println("⏳ shutdown signal received")
+		logger.Info("shutdown signal received")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
 		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("server shutdown error: %v", err)
+			logger.Error("server shutdown error", "error", err)
 		}
+		scheduler.Stop()
 		queue.Stop()
 	}()
 
-	log.Println("⚡ GoQueue running on :8080")
+	logger.Info("GoQueue running", "addr", ":8080")
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+		logger.Error("server error", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("GoQueue stopped")
+	logger.Info("GoQueue stopped")
 }

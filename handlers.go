@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +38,24 @@ type enqueueRequest struct {
 	Payload    map[string]string `json:"payload"`
 	Priority   JobPriority       `json:"priority"`
 	MaxRetries int               `json:"max_retries"`
+
+	// RunAt, if set, delays dispatch until this time (RFC3339). Omitted
+	// or in the past means "run as soon as a worker is free".
+	RunAt *time.Time `json:"run_at,omitempty"`
+
+	// TimeoutSeconds bounds a single execution attempt. 0 means no
+	// per-attempt deadline.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+
+	// DedupeKey/DedupeWindowSeconds suppress accepting another job with
+	// the same key while one is still within its window. Window 0 with
+	// a non-empty key falls back to a 1-minute default (see deduper).
+	DedupeKey           string `json:"dedupe_key,omitempty"`
+	DedupeWindowSeconds int    `json:"dedupe_window_seconds,omitempty"`
+
+	WebhookURL string       `json:"webhook_url,omitempty"`
+	OnSuccess  *JobTemplate `json:"on_success,omitempty"`
+	OnFailure  *JobTemplate `json:"on_failure,omitempty"`
 }
 
 func (h *Handlers) jobsHandler(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +100,10 @@ func (h *Handlers) enqueueJob(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "max_retries must be 0 or greater")
 		return
 	}
+	if body.TimeoutSeconds < 0 {
+		respondError(w, http.StatusBadRequest, "timeout_seconds must be 0 or greater")
+		return
+	}
 
 	job := &Job{
 		ID:         fmt.Sprintf("job_%d", time.Now().UnixNano()),
@@ -90,8 +114,25 @@ func (h *Handlers) enqueueJob(w http.ResponseWriter, r *http.Request) {
 		MaxRetries: body.MaxRetries,
 		CreatedAt:  time.Now().UTC(),
 	}
+	if body.RunAt != nil {
+		job.RunAt = body.RunAt.UTC()
+	}
+	if body.TimeoutSeconds > 0 {
+		job.Timeout = time.Duration(body.TimeoutSeconds) * time.Second
+	}
+	job.DedupeKey = body.DedupeKey
+	if body.DedupeWindowSeconds > 0 {
+		job.DedupeWindow = time.Duration(body.DedupeWindowSeconds) * time.Second
+	}
+	job.WebhookURL = body.WebhookURL
+	job.OnSuccess = body.OnSuccess
+	job.OnFailure = body.OnFailure
 
 	if err := h.queue.Enqueue(job); err != nil {
+		if errors.Is(err, ErrDuplicateJob) {
+			respondError(w, http.StatusConflict, err.Error())
+			return
+		}
 		respondError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -123,6 +164,22 @@ func (h *Handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.Status = &status
 	}
+	if limitParam := query.Get("limit"); limitParam != "" {
+		limit, err := strconv.Atoi(limitParam)
+		if err != nil || limit < 0 {
+			respondError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		filter.Limit = limit
+	}
+	if offsetParam := query.Get("offset"); offsetParam != "" {
+		offset, err := strconv.Atoi(offsetParam)
+		if err != nil || offset < 0 {
+			respondError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		filter.Offset = offset
+	}
 
 	jobs, err := h.store.List(filter)
 	if err != nil {
@@ -147,4 +204,67 @@ func (h *Handlers) getStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, http.StatusOK, stats)
+}
+
+func (h *Handlers) dlqHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	entries, err := h.store.ListDeadLetters()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, entries)
+}
+
+// dlqReplayHandler handles POST /dlq/{id}/replay — it reconstructs a
+// fresh job from the dead letter's original type/payload/priority,
+// re-enqueues it, and removes the dead letter entry on success. The
+// dead letter is left in place if re-enqueueing fails, so nothing is
+// lost if e.g. the queue happens to be full at that moment.
+func (h *Handlers) dlqReplayHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/dlq/")
+	id = strings.TrimSuffix(id, "/replay")
+	if id == "" {
+		respondError(w, http.StatusBadRequest, "invalid dead letter id")
+		return
+	}
+
+	entries, err := h.store.ListDeadLetters()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var entry *DeadLetter
+	for _, e := range entries {
+		if e.ID == id {
+			entry = e
+			break
+		}
+	}
+	if entry == nil {
+		respondError(w, http.StatusNotFound, fmt.Sprintf("dead letter %s not found", id))
+		return
+	}
+
+	job := NewJob(entry.Type, entry.Payload, entry.Priority, entry.MaxRetries)
+	if err := h.queue.Enqueue(job); err != nil {
+		respondError(w, http.StatusServiceUnavailable, fmt.Sprintf("replay failed, dead letter kept: %v", err))
+		return
+	}
+	if err := h.store.DeleteDeadLetter(entry.ID); err != nil {
+		// Job is already back in the queue at this point; a failed
+		// cleanup just means the DLQ entry lingers, not a lost job.
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("job replayed as %s but failed to clear dead letter: %v", job.ID, err))
+		return
+	}
+
+	respond(w, http.StatusOK, job)
 }
