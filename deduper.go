@@ -53,3 +53,15 @@ func (d *deduper) sweepLocked(now time.Time) {
 		}
 	}
 }
+
+// release removes a key's reservation so the same key can be used again
+// immediately — called when an enqueued job couldn't be dispatched (e.g.
+// queue full) and the caller should be allowed to retry.
+func (d *deduper) release(key string) {
+	if key == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.expires, key)
+}
