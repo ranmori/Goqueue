@@ -1,11 +1,20 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
+
+func generateID() string {
+	var buf [16]byte
+	_, _ = rand.Read(buf[:])
+	buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+	buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("job_%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:])
+}
 
 type JobStatus int
 
@@ -136,7 +145,7 @@ func (t *JobTemplate) ToJob() *Job {
 func NewJob(jobType string, payload map[string]string, priority JobPriority, maxRetries int) *Job {
 	now := time.Now().UTC()
 	return &Job{
-		ID:         fmt.Sprintf("job_%d", now.UnixNano()),
+		ID:         generateID(),
 		Type:       jobType,
 		Payload:    payload,
 		Priority:   priority,

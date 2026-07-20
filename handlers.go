@@ -105,6 +105,7 @@ func (h *Handlers) enqueueJob(w http.ResponseWriter, r *http.Request) {
 	if !h.authorized(w, r) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
 	var body enqueueRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid JSON")
@@ -123,15 +124,7 @@ func (h *Handlers) enqueueJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := &Job{
-		ID:         fmt.Sprintf("job_%d", time.Now().UnixNano()),
-		Type:       body.Type,
-		Payload:    body.Payload,
-		Priority:   body.Priority,
-		Status:     StatusPending,
-		MaxRetries: body.MaxRetries,
-		CreatedAt:  time.Now().UTC(),
-	}
+	job := NewJob(body.Type, body.Payload, body.Priority, body.MaxRetries)
 	if body.RunAt != nil {
 		job.RunAt = body.RunAt.UTC()
 	}

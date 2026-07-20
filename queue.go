@@ -162,7 +162,16 @@ func (q *Queue) Enqueue(job *Job) error {
 		return nil
 	}
 
-	return q.release(job)
+	if err := q.release(job); err != nil {
+		job.Status = StatusCancelled
+		job.Error = "queue full"
+		job.FinishedAt = timePtr(time.Now().UTC())
+		_ = q.store.Update(job)
+		q.dedupe.release(job.DedupeKey)
+		return err
+	}
+
+	return nil
 }
 
 // release hands a job directly to its priority channel, skipping the
@@ -185,6 +194,86 @@ func (q *Queue) Stop() {
 		close(q.stopCh)
 	})
 	q.wg.Wait()
+	q.drain()
+}
+
+// drain processes or cancels any jobs left in the priority channels after
+// all workers have exited, so nothing is silently lost on shutdown.
+func (q *Queue) drain() {
+	drained := 0
+	for {
+		select {
+		case job := <-q.highQueue:
+			q.drainJob(job)
+			drained++
+		case job := <-q.normalQueue:
+			q.drainJob(job)
+			drained++
+		case job := <-q.lowQueue:
+			q.drainJob(job)
+			drained++
+		default:
+			if drained > 0 {
+				q.log.Info("drained jobs from priority channels on shutdown", "count", drained)
+			}
+			return
+		}
+	}
+}
+
+// drainJob either runs a drained job to completion or marks it as
+// cancelled if no handler exists — the goal is to not lose track of it.
+func (q *Queue) drainJob(job *Job) {
+	if job == nil {
+		return
+	}
+	handler, exists := q.handlers[job.Type]
+	if !exists {
+		job.Status = StatusFailed
+		job.Error = fmt.Sprintf("no handler for job type: %s", job.Type)
+		job.FinishedAt = timePtr(time.Now().UTC())
+		if err := q.store.Update(job); err != nil {
+			q.log.Error("failed to update drained job with missing handler", "job_id", job.ID, "error", err)
+		}
+		q.moveToDeadLetter(job)
+		q.log.Warn("drained job has no handler, moved to dead letter", "job_id", job.ID, "type", job.Type)
+		return
+	}
+
+	job.Status = StatusRunning
+	now := time.Now().UTC()
+	job.StartedAt = &now
+	if err := q.store.Update(job); err != nil {
+		q.log.Error("failed to update drained job status to running", "job_id", job.ID, "error", err)
+	}
+
+	ctx := context.Background()
+	if job.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, job.Timeout)
+		defer cancel()
+	}
+
+	if err := handler(ctx, job); err != nil {
+		job.Status = StatusFailed
+		job.Error = err.Error()
+		job.Retries++
+		if err := q.store.Update(job); err != nil {
+			q.log.Error("failed to update drained job after handler failure", "job_id", job.ID, "error", err)
+		}
+		q.moveToDeadLetter(job)
+		q.log.Warn("drained job failed during shutdown", "job_id", job.ID, "type", job.Type, "error", err)
+		return
+	}
+
+	finished := time.Now().UTC()
+	job.FinishedAt = &finished
+	job.Status = StatusDone
+	job.Error = ""
+	if err := q.store.Update(job); err != nil {
+		q.log.Error("failed to update drained job status to done", "job_id", job.ID, "error", err)
+	}
+	q.log.Info("drained job completed during shutdown", "job_id", job.ID, "type", job.Type)
 }
 
 func (q *Queue) runWorker(id int) {
@@ -220,6 +309,10 @@ func (q *Queue) fetchJob() *Job {
 			return job
 		default:
 		}
+
+		// All lanes empty — sleep briefly to avoid busy-spinning
+		// while waiting for the scheduler or a new enqueue.
+		time.Sleep(time.Millisecond)
 
 		select {
 		case <-q.stopCh:
@@ -264,14 +357,18 @@ func (q *Queue) processJob(job *Job) {
 	now := processingStart
 	job.StartedAt = &now
 	job.Status = StatusRunning
-	_ = q.store.Update(job)
+	if err := q.store.Update(job); err != nil {
+		q.log.Error("failed to update job status to running", "job_id", job.ID, "error", err)
+	}
 
 	handler, exists := q.handlers[job.Type]
 	if !exists {
 		job.Status = StatusFailed
 		job.Error = fmt.Sprintf("no handler for job type: %s", job.Type)
 		job.FinishedAt = timePtr(time.Now().UTC())
-		_ = q.store.Update(job)
+		if err := q.store.Update(job); err != nil {
+			q.log.Error("failed to update job status after missing handler", "job_id", job.ID, "error", err)
+		}
 		q.finish(job, processingStart)
 		return
 	}
@@ -299,7 +396,9 @@ func (q *Queue) processJob(job *Job) {
 			job.FinishedAt = &finished
 			job.Status = StatusDone
 			job.Error = ""
-			_ = q.store.Update(job)
+			if err := q.store.Update(job); err != nil {
+				q.log.Error("failed to update job status to done", "job_id", job.ID, "error", err)
+			}
 			q.log.Info("job done", "job_id", job.ID, "type", job.Type, "attempts", attempt+1)
 			q.finish(job, processingStart)
 			return
@@ -314,14 +413,18 @@ func (q *Queue) processJob(job *Job) {
 
 		job.Retries = attempt + 1
 		job.Error = err.Error()
-		_ = q.store.Update(job)
+		if err := q.store.Update(job); err != nil {
+			q.log.Error("failed to update job after attempt failure", "job_id", job.ID, "error", err)
+		}
 		q.log.Warn("job attempt failed", "job_id", job.ID, "type", job.Type, "attempt", attempt+1, "error", err)
 	}
 
 	finished := time.Now().UTC()
 	job.FinishedAt = &finished
 	job.Status = StatusFailed
-	_ = q.store.Update(job)
+	if err := q.store.Update(job); err != nil {
+		q.log.Error("failed to update job status to failed", "job_id", job.ID, "error", err)
+	}
 	q.log.Error("job failed permanently", "job_id", job.ID, "type", job.Type, "retries", job.MaxRetries)
 
 	q.moveToDeadLetter(job)
