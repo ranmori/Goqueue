@@ -207,6 +207,32 @@ func (h *Handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, jobs)
 }
 
+func (h *Handlers) rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{
+		"service": "GoQueue",
+		"description": "A background job processor with priority queues, retries, " +
+			"scheduling, a dead-letter queue, rate limiting, deduplication, job " +
+			"chaining, webhooks, and Prometheus metrics.",
+		"endpoints": map[string]string{
+			"GET  /health":          "liveness check",
+			"POST /jobs":            "enqueue a job (requires X-API-Key if configured)",
+			"GET  /jobs":            "list jobs (?type=&status=&limit=&offset=)",
+			"GET  /jobs/{id}":       "get a single job",
+			"DELETE /jobs/{id}":     "cancel a pending job (requires X-API-Key if configured)",
+			"GET  /stats":           "job counts by status",
+			"GET  /dlq":             "list dead-lettered jobs",
+			"POST /dlq/{id}/replay": "re-enqueue a dead-lettered job (requires X-API-Key if configured)",
+			"GET  /metrics":         "Prometheus-format metrics",
+		},
+		"source": "https://github.com/ranmori/Goqueue",
+	})
+}
+
 func (h *Handlers) cancelJob(w http.ResponseWriter, r *http.Request, id string) {
 	if !h.authorized(w, r) {
 		return

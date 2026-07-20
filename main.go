@@ -86,6 +86,7 @@ func main() {
 		logger.Warn("API_KEY is not set — write endpoints (POST /jobs, DELETE /jobs/{id}, POST /dlq/{id}/replay) are unauthenticated")
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", handlers.rootHandler)
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/jobs/", handlers.jobHandler)
 	mux.HandleFunc("/jobs", handlers.jobsHandler)
