@@ -280,19 +280,8 @@ func (h *Handlers) dlqReplayHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := h.store.ListDeadLetters()
+	entry, err := h.store.GetDeadLetter(id)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	var entry *DeadLetter
-	for _, e := range entries {
-		if e.ID == id {
-			entry = e
-			break
-		}
-	}
-	if entry == nil {
 		respondError(w, http.StatusNotFound, fmt.Sprintf("dead letter %s not found", id))
 		return
 	}

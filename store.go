@@ -47,6 +47,7 @@ type Store interface {
 	Stats() (map[string]int, error)
 
 	SaveDeadLetter(entry *DeadLetter) error
+	GetDeadLetter(id string) (*DeadLetter, error)
 	ListDeadLetters() ([]*DeadLetter, error)
 	DeleteDeadLetter(id string) error
 }
@@ -165,6 +166,16 @@ func (s *InMemoryStore) SaveDeadLetter(entry *DeadLetter) error {
 	}
 	s.deadLetters[entry.ID] = entry
 	return nil
+}
+
+func (s *InMemoryStore) GetDeadLetter(id string) (*DeadLetter, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, exists := s.deadLetters[id]
+	if !exists {
+		return nil, fmt.Errorf("dead letter %s not found", id)
+	}
+	return entry, nil
 }
 
 func (s *InMemoryStore) ListDeadLetters() ([]*DeadLetter, error) {
@@ -401,10 +412,12 @@ FROM jobs`
 	query += " ORDER BY created_at DESC"
 
 	if filter.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", filter.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, filter.Limit)
 	}
 	if filter.Offset > 0 {
-		query += fmt.Sprintf(" OFFSET %d", filter.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args)+1)
+		args = append(args, filter.Offset)
 	}
 
 	rows, err := s.db.Query(query, args...)
@@ -487,6 +500,28 @@ INSERT INTO dead_letters (
 ON CONFLICT (id) DO NOTHING
 `, entry.ID, entry.JobID, entry.Type, payload, int(entry.Priority), entry.MaxRetries, entry.Error, entry.FailedAt, entry.OriginallyCreatedAt)
 	return err
+}
+
+func (s *PostgresStore) GetDeadLetter(id string) (*DeadLetter, error) {
+	row := s.db.QueryRow(`
+SELECT id, job_id, type, payload, priority, max_retries, error, failed_at, originally_created_at
+FROM dead_letters
+WHERE id = $1
+`, id)
+	var d DeadLetter
+	var payloadBytes []byte
+	var priority int
+	if err := row.Scan(&d.ID, &d.JobID, &d.Type, &payloadBytes, &priority, &d.MaxRetries, &d.Error, &d.FailedAt, &d.OriginallyCreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("dead letter %s not found", id)
+		}
+		return nil, err
+	}
+	d.Priority = JobPriority(priority)
+	if len(payloadBytes) > 0 {
+		_ = json.Unmarshal(payloadBytes, &d.Payload)
+	}
+	return &d, nil
 }
 
 func (s *PostgresStore) ListDeadLetters() ([]*DeadLetter, error) {

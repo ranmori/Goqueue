@@ -275,7 +275,7 @@ gofmt -l .                # formatting
 go vet ./...              # static analysis
 ```
 
-16 tests cover priority ordering, retry/backoff, timeout enforcement,
+20 tests cover priority ordering, retry/backoff, timeout enforcement,
 delayed scheduling, rate limiting, deduplication (including window
 expiry), success/failure chaining, dead-letter archival and replay,
 pagination, and metrics output.
