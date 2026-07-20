@@ -14,6 +14,136 @@ question ("what happens if a handler hangs forever?", "what happens to a
 job that fails for good?") rather than being added for its own sake — see
 [Design notes](#design-notes) for the reasoning behind each one.
 
+## Architecture
+
+```mermaid
+graph TB
+    subgraph "HTTP API (:8080)"
+        REST["REST Endpoints<br/>POST /jobs · GET /jobs · DELETE /jobs/{id}<br/>/stats · /dlq · /metrics · /health"]
+    end
+
+    subgraph "Queue Engine"
+        DEDUP{"Deduplication<br/>Key + Window"}
+        SCH["Scheduler<br/>(min-heap by RunAt)"]
+        HIGH[/"High Lane<br/>(cap 1000)"/]
+        NORM[/"Normal Lane<br/>(cap 1000)"/]
+        LOW[/"Low Lane<br/>(cap 1000)"/]
+    end
+
+    subgraph "Worker Pool"
+        W1["Worker 1"]
+        W2["Worker 2"]
+        WN["Worker N"]
+    end
+
+    subgraph "Per-Type Rate Limiting"
+        LIM["Concurrency Limiter<br/>(buffered-channel semaphore)"]
+    end
+
+    subgraph "Storage"
+        STORE[("Store Interface<br/>InMemory · PostgreSQL")]
+        DLQ[("Dead Letter<br/>Queue")]
+    end
+
+    subgraph "Post-Processing"
+        MET["Metrics<br/>(Prometheus /metrics)"]
+        WH["Webhooks<br/>(fire-and-forget POST)"]
+        CHAIN["Job Chaining<br/>on_success / on_failure"]
+    end
+
+    REST -->|enqueue| DEDUP
+    DEDUP -->|new key| SCH
+    DEDUP -->|immediate| HIGH
+    DEDUP -->|immediate| NORM
+    DEDUP -->|immediate| LOW
+    SCH -->|RunAt due| HIGH
+    SCH -->|RunAt due| NORM
+    SCH -->|RunAt due| LOW
+
+    HIGH & NORM & LOW --> W1 & W2 & WN
+    W1 & W2 & WN --> LIM
+    LIM -->|acquire slot| STORE
+    LIM -->|release slot| HIGH & NORM & LOW
+
+    W1 & W2 & WN -->|terminal status| MET
+    W1 & W2 & WN -->|webhook_url set| WH
+    W1 & W2 & WN -->|on_success/on_failure| CHAIN
+    CHAIN -->|re-enqueue| DEDUP
+    W1 & W2 & WN -->|retries exhausted| DLQ
+
+    STORE --- DLQ
+```
+
+### Priority queue internals
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as HTTP Handler
+    participant D as Deduper
+    participant Q as Priority Channels
+    participant S as Scheduler
+    participant W as Worker Pool
+    participant L as Concurrency Limiter
+    participant Store as Store
+
+    C->>API: POST /jobs {type, priority, ...}
+    API->>D: tryAcquire(key, window)
+    alt duplicate key
+        D-->>API: false
+        API-->>C: 409 Conflict
+    else new key
+        D-->>API: true
+        API->>Store: Save(job)
+        alt future RunAt
+            API->>S: Schedule(job)
+            Note over S: holds in min-heap
+            S->>Q: release(job) when RunAt due
+        else immediate
+            API->>Q: release(job)
+            alt channel full
+                Q-->>API: error
+                API->>Store: Update(status=cancelled)
+                API->>D: release(key)
+                API-->>C: 503 Queue Full
+            else accepted
+                Q-->>API: ok
+                API-->>C: 201 Created
+            end
+        end
+    end
+
+    loop fetchJob() — priority order
+        W->>Q: non-blocking read high → normal → low
+        alt all empty
+            W->>Q: blocking select (+ 1ms backoff)
+        end
+    end
+
+    W->>L: acquire(type)
+    alt concurrency limit hit
+        Note over L: blocks until slot free
+    end
+    L-->>W: slot acquired
+
+    W->>Store: Update(status=running)
+    W->>W: handler(ctx, job)
+    alt handler success
+        W->>Store: Update(status=done)
+        W->>W: metrics + webhook + chain
+    else handler error + retries left
+        W->>Store: Update(retries++, error)
+        Note over W: sleep 2^(attempt-1)s
+        W->>W: retry
+    else retries exhausted
+        W->>Store: Update(status=failed)
+        W->>Store: SaveDeadLetter(entry)
+        W->>W: metrics + webhook + on_failure chain
+    end
+
+    W->>L: release(slot)
+```
+
 ## Features
 
 - **Priority queues** — high/normal/low lanes, always drained in that order.
