@@ -38,6 +38,8 @@ func main() {
 	queue := NewQueue(store, 5)
 	queue.SetLogger(logger)
 
+	// Example: cap "email" at 10 concurrent sends regardless of worker
+	// count, so a burst of emails can't starve webhook/report jobs.
 	queue.SetConcurrencyLimit("email", 10)
 
 	queue.RegisterHandler("email", func(ctx context.Context, job *Job) error {
@@ -79,7 +81,10 @@ func main() {
 
 	queue.Start()
 
-	handlers := &Handlers{queue: queue, store: store}
+	handlers := &Handlers{queue: queue, store: store, apiKey: os.Getenv("API_KEY")}
+	if handlers.apiKey == "" {
+		logger.Warn("API_KEY is not set — write endpoints (POST /jobs, DELETE /jobs/{id}, POST /dlq/{id}/replay) are unauthenticated")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/jobs/", handlers.jobHandler)

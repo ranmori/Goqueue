@@ -29,8 +29,23 @@ func respondError(w http.ResponseWriter, status int, message string) {
 }
 
 type Handlers struct {
-	queue *Queue
-	store Store
+	queue  *Queue
+	store  Store
+	apiKey string // empty means no auth required (e.g. local dev)
+}
+
+// authorized checks X-API-Key for mutating endpoints. Returns false (and
+// has already written the 401 response) if the request should be
+// rejected — callers should return immediately when it does.
+func (h *Handlers) authorized(w http.ResponseWriter, r *http.Request) bool {
+	if h.apiKey == "" {
+		return true
+	}
+	if r.Header.Get("X-API-Key") != h.apiKey {
+		respondError(w, http.StatusUnauthorized, "missing or invalid X-API-Key header")
+		return false
+	}
+	return true
 }
 
 type enqueueRequest struct {
@@ -87,6 +102,9 @@ func (h *Handlers) jobHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) enqueueJob(w http.ResponseWriter, r *http.Request) {
+	if !h.authorized(w, r) {
+		return
+	}
 	var body enqueueRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid JSON")
@@ -190,6 +208,9 @@ func (h *Handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) cancelJob(w http.ResponseWriter, r *http.Request, id string) {
+	if !h.authorized(w, r) {
+		return
+	}
 	if err := h.store.Cancel(id); err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
@@ -227,6 +248,9 @@ func (h *Handlers) dlqHandler(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) dlqReplayHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.authorized(w, r) {
 		return
 	}
 

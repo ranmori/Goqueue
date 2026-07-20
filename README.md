@@ -54,6 +54,12 @@ startup: `email`, `webhook`, and `report` (see `main.go`).
 
 ## API
 
+Set `API_KEY` in the environment to require an `X-API-Key` header on
+mutating requests (`POST /jobs`, `DELETE /jobs/{id}`, `POST /dlq/{id}/replay`).
+Read endpoints stay open either way. If `API_KEY` is unset, all endpoints
+are open — fine for local dev, not for anything public-facing (see
+`DEPLOY.md`).
+
 ### `POST /jobs` — enqueue a job
 
 ```json
