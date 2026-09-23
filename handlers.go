@@ -32,6 +32,22 @@ type Handlers struct {
 	queue  *Queue
 	store  Store
 	apiKey string // empty means no auth required (e.g. local dev)
+
+	// leader reports leader-election state for GET /leader. Nil in
+	// single-node mode, where this instance is trivially the leader.
+	leader func() LeaderStatus
+}
+
+func (h *Handlers) leaderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if h.leader == nil {
+		respond(w, http.StatusOK, LeaderStatus{Mode: "single-node", IsLeader: true})
+		return
+	}
+	respond(w, http.StatusOK, h.leader())
 }
 
 // authorized checks X-API-Key for mutating endpoints. Returns false (and
@@ -221,6 +237,7 @@ func (h *Handlers) rootHandler(w http.ResponseWriter, r *http.Request) {
 			"GET  /dlq":             "list dead-lettered jobs",
 			"POST /dlq/{id}/replay": "re-enqueue a dead-lettered job (requires X-API-Key if configured)",
 			"GET  /metrics":         "Prometheus-format metrics",
+			"GET  /leader":          "leader-election status of this instance",
 		},
 		"source": "https://github.com/ranmori/Goqueue",
 	})

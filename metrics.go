@@ -55,6 +55,7 @@ type Metrics struct {
 
 	queueDepthFn func() map[string]int
 	scheduledFn  func() int
+	leaderFn     func() bool
 }
 
 type metricKey struct {
@@ -83,6 +84,12 @@ func (m *Metrics) SetQueueDepthFunc(fn func() map[string]int) {
 
 func (m *Metrics) SetScheduledFunc(fn func() int) {
 	m.scheduledFn = fn
+}
+
+// SetLeaderFunc wires in leader-election state, exported as the
+// goqueue_is_leader gauge. Left unset in single-node mode.
+func (m *Metrics) SetLeaderFunc(fn func() bool) {
+	m.leaderFn = fn
 }
 
 // RecordCompletion should be called once per job, when it reaches a
@@ -180,6 +187,16 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.WriteString("# HELP goqueue_scheduled_jobs Jobs currently held by the scheduler awaiting their run_at.\n")
 		b.WriteString("# TYPE goqueue_scheduled_jobs gauge\n")
 		fmt.Fprintf(&b, "goqueue_scheduled_jobs %d\n", m.scheduledFn())
+	}
+
+	if m.leaderFn != nil {
+		b.WriteString("# HELP goqueue_is_leader 1 if this instance currently holds leadership, else 0.\n")
+		b.WriteString("# TYPE goqueue_is_leader gauge\n")
+		isLeader := 0
+		if m.leaderFn() {
+			isLeader = 1
+		}
+		fmt.Fprintf(&b, "goqueue_is_leader %d\n", isLeader)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
