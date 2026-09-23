@@ -1,0 +1,9 @@
+# Check every text file out with LF, on every platform. Without this a
+# Windows clone with core.autocrlf=true gets CRLF working-tree files,
+# and `gofmt -l .` then flags every .go file as unformatted.
+* text=auto eol=lf
+
+# Never touch binaries, should one ever be committed deliberately.
+*.exe -text
+*.png -text
+*.jpg -text
