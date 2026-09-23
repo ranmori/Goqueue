@@ -1,0 +1,93 @@
+# Local HA stack: a 3-node etcd cluster, one Postgres, and two GoQueue
+# instances competing for leadership. See scripts/failover-demo.sh.
+#
+#   docker compose up -d --build --wait
+#   curl localhost:8081/leader; curl localhost:8082/leader
+#
+# Three etcd members, not one: etcd needs a majority (2 of 3) to commit
+# anything, including lease expiry. With three you can `docker stop etcd2`
+# and elections keep working; stop a second member and they correctly
+# halt instead of risking two leaders.
+
+x-etcd: &etcd
+  image: gcr.io/etcd-development/etcd:v3.5.21
+  environment: &etcd-env
+    ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    ETCD_INITIAL_CLUSTER_STATE: new
+    ETCD_INITIAL_CLUSTER_TOKEN: goqueue-dev
+    ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
+x-goqueue: &goqueue
+  build: .
+  environment: &goqueue-env
+    DATABASE_URL: postgres://goqueue:goqueue@postgres:5432/goqueue?sslmode=disable
+    ETCD_ENDPOINTS: etcd1:2379,etcd2:2379,etcd3:2379
+    ETCD_SESSION_TTL: "5"
+  depends_on:
+    postgres: { condition: service_healthy }
+    etcd1: { condition: service_healthy }
+    etcd2: { condition: service_healthy }
+    etcd3: { condition: service_healthy }
+  # An instance that loses leadership exits on purpose and is restarted
+  # here as a fresh follower. `docker kill`/`docker stop` count as manual
+  # stops, so the demo's killed leader stays down.
+  restart: on-failure
+  stop_grace_period: 20s
+
+services:
+  etcd1:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd1
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+    ports: ["2379:2379"]
+  etcd2:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd2
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+  etcd3:
+    <<: *etcd
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd3
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: goqueue
+      POSTGRES_PASSWORD: goqueue
+      POSTGRES_DB: goqueue
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U goqueue"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  goqueue-1:
+    <<: *goqueue
+    container_name: goqueue-1
+    environment:
+      <<: *goqueue-env
+      INSTANCE_ID: goqueue-1
+    ports: ["8081:8080"]
+  goqueue-2:
+    <<: *goqueue
+    container_name: goqueue-2
+    environment:
+      <<: *goqueue-env
+      INSTANCE_ID: goqueue-2
+    ports: ["8082:8080"]
