@@ -28,6 +28,11 @@ type Queue struct {
 	accepting   bool
 	scheduler   *Scheduler
 
+	// storeDispatch is set under leader election: Enqueue only persists
+	// the job, and the leader's Dispatcher claims it from the shared
+	// store. See UseStoreDispatch.
+	storeDispatch bool
+
 	limiter *concurrencyLimiter
 	dedupe  *deduper
 	metrics *Metrics
@@ -42,6 +47,16 @@ type Queue struct {
 // caller intends to use delayed/scheduled jobs at all.
 func (q *Queue) SetScheduler(s *Scheduler) {
 	q.scheduler = s
+}
+
+// UseStoreDispatch switches the Queue to shared-store mode for running
+// several instances under leader election. Enqueue then only persists
+// the job as pending (on any instance, leader or follower), and nothing
+// reaches a worker until the elected leader's Dispatcher claims it. Jobs
+// left in the local channels at Stop are handed back as pending instead
+// of being run, so the next leader picks them up.
+func (q *Queue) UseStoreDispatch() {
+	q.storeDispatch = true
 }
 
 // SetConcurrencyLimit caps how many jobs of jobType may run at once
@@ -154,6 +169,10 @@ func (q *Queue) Enqueue(job *Job) error {
 		return err
 	}
 
+	if q.storeDispatch {
+		return nil
+	}
+
 	if !job.IsDue(now) {
 		if q.scheduler == nil {
 			return fmt.Errorf("job has a future run_at but no scheduler is configured")
@@ -223,8 +242,15 @@ func (q *Queue) drain() {
 
 // drainJob either runs a drained job to completion or marks it as
 // cancelled if no handler exists — the goal is to not lose track of it.
+// In store-dispatch mode it hands the job back to the store instead, so
+// a resigning leader doesn't delay failover running work it hasn't
+// started yet.
 func (q *Queue) drainJob(job *Job) {
 	if job == nil {
+		return
+	}
+	if q.storeDispatch {
+		q.handBack(job)
 		return
 	}
 	handler, exists := q.handlers[job.Type]
@@ -274,6 +300,22 @@ func (q *Queue) drainJob(job *Job) {
 		q.log.Error("failed to update drained job status to done", "job_id", job.ID, "error", err)
 	}
 	q.log.Info("drained job completed during shutdown", "job_id", job.ID, "type", job.Type)
+}
+
+// handBack returns a claimed-but-unstarted job to pending so whichever
+// instance leads next can claim it.
+func (q *Queue) handBack(job *Job) {
+	job.Status = StatusPending
+	job.StartedAt = nil
+	if err := q.store.Update(job); err != nil {
+		q.log.Error("failed to hand job back to store", "job_id", job.ID, "error", err)
+	}
+}
+
+// buffered reports how many jobs are sitting in the priority channels
+// waiting for a worker.
+func (q *Queue) buffered() int {
+	return len(q.highQueue) + len(q.normalQueue) + len(q.lowQueue)
 }
 
 func (q *Queue) runWorker(id int) {

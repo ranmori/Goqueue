@@ -226,8 +226,30 @@ func NewPostgresStore(dsn string) (Store, error) {
 	return store, nil
 }
 
+// schemaLockKey is an arbitrary constant for pg_advisory_xact_lock.
+const schemaLockKey = 0x676f7175657565 // "goqueue"
+
 func (s *PostgresStore) ensureSchema() error {
-	_, err := s.db.Exec(`
+	// Several instances starting at once (docker compose up) would race
+	// on CREATE TABLE IF NOT EXISTS, which isn't concurrency-safe in
+	// Postgres — the loser fails on pg_type's unique index. Serialise
+	// migrations behind an advisory lock held for the transaction.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, int64(schemaLockKey)); err != nil {
+		return err
+	}
+	if err := migrate(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func migrate(tx *sql.Tx) error {
+	_, err := tx.Exec(`
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -246,7 +268,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 		return err
 	}
 
-	_, err = s.db.Exec(`
+	_, err = tx.Exec(`
 CREATE TABLE IF NOT EXISTS dead_letters (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -259,20 +281,179 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     originally_created_at TIMESTAMPTZ NOT NULL
 )
 `)
+	if err != nil {
+		return err
+	}
+
+	// Columns needed once jobs are dispatched from the store rather than
+	// handed over in memory (leader election mode): the dispatcher only
+	// sees what is persisted here. claimed_epoch records which leader
+	// claimed a running job, for debugging stuck or duplicated work.
+	_, err = tx.Exec(`
+ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS run_at TIMESTAMPTZ NULL,
+    ADD COLUMN IF NOT EXISTS timeout_ns BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS webhook_url TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS on_success JSONB NULL,
+    ADD COLUMN IF NOT EXISTS on_failure JSONB NULL,
+    ADD COLUMN IF NOT EXISTS claimed_epoch BIGINT NOT NULL DEFAULT 0
+`)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(`CREATE INDEX IF NOT EXISTS jobs_dispatch_idx ON jobs (status, priority DESC, created_at)`)
+	if err != nil {
+		return err
+	}
+
+	// leader_fence holds a single row: the epoch of the most recent
+	// leader to take over. See TakeOver and ClaimDue.
+	_, err = tx.Exec(`
+CREATE TABLE IF NOT EXISTS leader_fence (
+    id INT PRIMARY KEY,
+    epoch BIGINT NOT NULL
+);
+INSERT INTO leader_fence (id, epoch) VALUES (1, 0) ON CONFLICT (id) DO NOTHING
+`)
 	return err
 }
 
-func (s *PostgresStore) Save(job *Job) error {
+const jobColumns = `id, type, payload, priority, status, retries, max_retries, error, created_at, started_at, finished_at,
+    run_at, timeout_ns, webhook_url, on_success, on_failure`
+
+// jobArgs returns the values for jobColumns, in order.
+func jobArgs(job *Job) ([]interface{}, error) {
 	payload, err := json.Marshal(job.Payload)
+	if err != nil {
+		return nil, err
+	}
+	onSuccess, err := nullJSON(job.OnSuccess)
+	if err != nil {
+		return nil, err
+	}
+	onFailure, err := nullJSON(job.OnFailure)
+	if err != nil {
+		return nil, err
+	}
+	var runAt *time.Time
+	if !job.RunAt.IsZero() {
+		runAt = &job.RunAt
+	}
+	return []interface{}{
+		job.ID, job.Type, payload, int(job.Priority), int(job.Status), job.Retries, job.MaxRetries, job.Error,
+		job.CreatedAt, nullTime(job.StartedAt), nullTime(job.FinishedAt),
+		nullTime(runAt), int64(job.Timeout), job.WebhookURL, onSuccess, onFailure,
+	}, nil
+}
+
+func nullJSON(t *JobTemplate) (interface{}, error) {
+	if t == nil {
+		return nil, nil
+	}
+	return json.Marshal(t)
+}
+
+// TakeOver implements ClaimStore. Both statements run in one
+// transaction, and the fence row stays locked until commit, so a stale
+// leader's in-flight ClaimDue either commits first (and its claims are
+// requeued here) or blocks and then sees the new epoch and claims nothing.
+func (s *PostgresStore) TakeOver(ctx context.Context, epoch int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE leader_fence SET epoch = $1 WHERE id = 1 AND epoch < $1`, epoch)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		return 0, ErrFenced
+	}
+
+	// Only the leader ever runs jobs, so anything still "running" belongs
+	// to a previous leader that died or gave up before finishing it.
+	result, err = tx.ExecContext(ctx, `
+UPDATE jobs SET status = $1, started_at = NULL
+WHERE status = $2
+`, int(StatusPending), int(StatusRunning))
+	if err != nil {
+		return 0, err
+	}
+	requeued, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return requeued, tx.Commit()
+}
+
+// ClaimDue implements ClaimStore. FOR SHARE on the fence row is what
+// serialises it against TakeOver; SKIP LOCKED only matters if two
+// claimers ever overlap (e.g. a stale leader during the fence handoff).
+func (s *PostgresStore) ClaimDue(ctx context.Context, epoch int64, limit int) ([]*Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+WITH fence AS (
+    SELECT epoch FROM leader_fence WHERE id = 1 AND epoch = $1 FOR SHARE
+), picked AS (
+    SELECT j.id FROM jobs j
+    WHERE j.status = $2
+      AND (j.run_at IS NULL OR j.run_at <= now())
+      AND EXISTS (SELECT 1 FROM fence)
+    ORDER BY j.priority DESC, j.created_at
+    LIMIT $3
+    FOR UPDATE OF j SKIP LOCKED
+)
+UPDATE jobs SET status = $4, started_at = now(), claimed_epoch = $1
+FROM picked
+WHERE jobs.id = picked.id
+RETURNING `+qualifiedJobColumns("jobs"), epoch, int(StatusPending), limit, int(StatusRunning))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	jobs := make([]*Job, 0, limit)
+	for rows.Next() {
+		job, err := s.scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// RETURNING order is unspecified; restore dispatch order.
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if jobs[i].Priority != jobs[j].Priority {
+			return jobs[i].Priority > jobs[j].Priority
+		}
+		return jobs[i].CreatedAt.Before(jobs[j].CreatedAt)
+	})
+	return jobs, nil
+}
+
+func qualifiedJobColumns(table string) string {
+	cols := strings.Split(jobColumns, ",")
+	for i, c := range cols {
+		cols[i] = table + "." + strings.TrimSpace(c)
+	}
+	return strings.Join(cols, ", ")
+}
+
+func (s *PostgresStore) Save(job *Job) error {
+	args, err := jobArgs(job)
 	if err != nil {
 		return err
 	}
 
 	_, err = s.db.Exec(`
-INSERT INTO jobs (
-    id, type, payload, priority, status, retries, max_retries, error, created_at, started_at, finished_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+INSERT INTO jobs (`+jobColumns+`) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
 ) ON CONFLICT (id) DO UPDATE SET
     type = EXCLUDED.type,
     payload = EXCLUDED.payload,
@@ -283,8 +464,13 @@ INSERT INTO jobs (
     error = EXCLUDED.error,
     created_at = EXCLUDED.created_at,
     started_at = EXCLUDED.started_at,
-    finished_at = EXCLUDED.finished_at
-`, job.ID, job.Type, payload, int(job.Priority), int(job.Status), job.Retries, job.MaxRetries, job.Error, job.CreatedAt, nullTime(job.StartedAt), nullTime(job.FinishedAt))
+    finished_at = EXCLUDED.finished_at,
+    run_at = EXCLUDED.run_at,
+    timeout_ns = EXCLUDED.timeout_ns,
+    webhook_url = EXCLUDED.webhook_url,
+    on_success = EXCLUDED.on_success,
+    on_failure = EXCLUDED.on_failure
+`, args...)
 	return err
 }
 
@@ -296,7 +482,7 @@ func nullTime(value *time.Time) interface{} {
 }
 
 func (s *PostgresStore) Update(job *Job) error {
-	payload, err := json.Marshal(job.Payload)
+	args, err := jobArgs(job)
 	if err != nil {
 		return err
 	}
@@ -312,9 +498,14 @@ UPDATE jobs SET
     error = $8,
     created_at = $9,
     started_at = $10,
-    finished_at = $11
+    finished_at = $11,
+    run_at = $12,
+    timeout_ns = $13,
+    webhook_url = $14,
+    on_success = $15,
+    on_failure = $16
 WHERE id = $1
-`, job.ID, job.Type, payload, int(job.Priority), int(job.Status), job.Retries, job.MaxRetries, job.Error, job.CreatedAt, nullTime(job.StartedAt), nullTime(job.FinishedAt))
+`, args...)
 	if err != nil {
 		return err
 	}
@@ -329,11 +520,7 @@ WHERE id = $1
 }
 
 func (s *PostgresStore) Get(id string) (*Job, error) {
-	row := s.db.QueryRow(`
-SELECT id, type, payload, priority, status, retries, max_retries, error, created_at, started_at, finished_at
-FROM jobs
-WHERE id = $1
-`, id)
+	row := s.db.QueryRow(`SELECT `+jobColumns+` FROM jobs WHERE id = $1`, id)
 	return s.scanJob(row)
 }
 
@@ -348,6 +535,9 @@ func (s *PostgresStore) scanJob(scanner rowScanner) (*Job, error) {
 	var finishedAt sql.NullTime
 	var priority int
 	var status int
+	var runAt sql.NullTime
+	var timeoutNs int64
+	var onSuccess, onFailure []byte
 
 	job := &Job{}
 	if err := scanner.Scan(
@@ -362,6 +552,11 @@ func (s *PostgresStore) scanJob(scanner rowScanner) (*Job, error) {
 		&job.CreatedAt,
 		&startedAt,
 		&finishedAt,
+		&runAt,
+		&timeoutNs,
+		&job.WebhookURL,
+		&onSuccess,
+		&onFailure,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("job %s not found", job.ID)
@@ -386,14 +581,22 @@ func (s *PostgresStore) scanJob(scanner rowScanner) (*Job, error) {
 	if finishedAt.Valid {
 		job.FinishedAt = &finishedAt.Time
 	}
+	if runAt.Valid {
+		job.RunAt = runAt.Time.UTC()
+	}
+	job.Timeout = time.Duration(timeoutNs)
+	if len(onSuccess) > 0 {
+		_ = json.Unmarshal(onSuccess, &job.OnSuccess)
+	}
+	if len(onFailure) > 0 {
+		_ = json.Unmarshal(onFailure, &job.OnFailure)
+	}
 
 	return job, nil
 }
 
 func (s *PostgresStore) List(filter JobFilter) ([]*Job, error) {
-	query := `
-SELECT id, type, payload, priority, status, retries, max_retries, error, created_at, started_at, finished_at
-FROM jobs`
+	query := `SELECT ` + jobColumns + ` FROM jobs`
 
 	var conditions []string
 	var args []interface{}

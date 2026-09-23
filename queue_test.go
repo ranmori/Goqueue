@@ -495,3 +495,53 @@ func TestMetricsExposesJobCounts(t *testing.T) {
 		t.Fatalf("missing duration histogram, got:\n%s", body)
 	}
 }
+
+func TestStoreDispatchEnqueueOnlyPersists(t *testing.T) {
+	store := NewInMemoryStore()
+	q := NewQueue(store, 1)
+	q.UseStoreDispatch()
+
+	job := NewJob("noop", nil, PriorityHigh, 0)
+	job.RunAt = time.Now().UTC().Add(time.Hour) // no scheduler: must still be accepted
+	if err := q.Enqueue(job); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if n := q.buffered(); n != 0 {
+		t.Fatalf("store-dispatch enqueue put %d jobs in local channels; only the leader's dispatcher should", n)
+	}
+	saved, err := store.Get(job.ID)
+	if err != nil || saved.Status != StatusPending {
+		t.Fatalf("want job persisted as pending, got %+v (err %v)", saved, err)
+	}
+}
+
+func TestStoreDispatchStopHandsBackUnstartedJobs(t *testing.T) {
+	store := NewInMemoryStore()
+	q := NewQueue(store, 1)
+	q.UseStoreDispatch()
+
+	var ran atomic.Bool
+	q.RegisterHandler("noop", func(ctx context.Context, job *Job) error {
+		ran.Store(true)
+		return nil
+	})
+
+	// Simulate a dispatcher claim that no worker picked up yet.
+	job := NewJob("noop", nil, PriorityNormal, 0)
+	job.Status = StatusRunning
+	job.StartedAt = timePtr(time.Now().UTC())
+	_ = store.Save(job)
+	if err := q.release(job); err != nil {
+		t.Fatal(err)
+	}
+
+	q.Stop() // workers never started, so the job is still buffered
+
+	if ran.Load() {
+		t.Fatal("resigning leader ran a buffered job instead of handing it back")
+	}
+	saved, _ := store.Get(job.ID)
+	if saved.Status != StatusPending || saved.StartedAt != nil {
+		t.Fatalf("want job handed back as pending, got status %s", saved.Status)
+	}
+}
