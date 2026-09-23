@@ -13,8 +13,6 @@ import (
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -75,13 +73,39 @@ func main() {
 		}
 	})
 
-	scheduler := NewScheduler(queue.release, 200*time.Millisecond)
-	queue.SetScheduler(scheduler)
-	scheduler.Start()
-
-	queue.Start()
-
 	handlers := &Handlers{queue: queue, store: store, apiKey: os.Getenv("API_KEY")}
+
+	// With ETCD_ENDPOINTS set, several instances share one Postgres and
+	// elect a single dispatcher through etcd. Without it, this process is
+	// the only one and dispatches in-memory exactly as before.
+	var node *haNode
+	var scheduler *Scheduler
+	if endpoints := splitEndpoints(os.Getenv("ETCD_ENDPOINTS")); len(endpoints) > 0 {
+		claimStore, ok := store.(ClaimStore)
+		if !ok {
+			logger.Error("ETCD_ENDPOINTS is set but the store can't be shared between instances; set DATABASE_URL")
+			os.Exit(1)
+		}
+		queue.UseStoreDispatch()
+		elector, err := NewElector(LeaderConfig{
+			Endpoints: endpoints,
+			ID:        instanceID(),
+			TTL:       envInt("ETCD_SESSION_TTL", 5),
+		}, logger)
+		if err != nil {
+			logger.Error("failed to join leader election", "error", err)
+			os.Exit(1)
+		}
+		node = &haNode{elector: elector, queue: queue, store: claimStore, log: logger}
+		handlers.leader = elector.Status
+		queue.Metrics().SetLeaderFunc(elector.IsLeader)
+	} else {
+		scheduler = NewScheduler(queue.release, 200*time.Millisecond)
+		queue.SetScheduler(scheduler)
+		scheduler.Start()
+		queue.Start()
+	}
+
 	if handlers.apiKey == "" {
 		logger.Warn("API_KEY is not set — write endpoints (POST /jobs, DELETE /jobs/{id}, POST /dlq/{id}/replay) are unauthenticated")
 	}
@@ -94,33 +118,66 @@ func main() {
 	mux.HandleFunc("/dlq", handlers.dlqHandler)
 	mux.HandleFunc("/dlq/", handlers.dlqReplayHandler)
 	mux.HandleFunc("/metrics", queue.Metrics().ServeHTTP)
+	mux.HandleFunc("/leader", handlers.leaderHandler)
 
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: mux,
 	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
+	serverErr := make(chan error, 1)
 	go func() {
-		<-stop
-		logger.Info("shutdown signal received")
-
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-
-		if err := server.Shutdown(ctx); err != nil {
-			logger.Error("server shutdown error", "error", err)
+		logger.Info("GoQueue running", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
 		}
-		scheduler.Stop()
-		queue.Stop()
 	}()
 
-	logger.Info("GoQueue running", "addr", ":8080")
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	haCtx, haCancel := context.WithCancel(context.Background())
+	defer haCancel()
+	haDone := make(chan error, 1)
+	if node != nil {
+		go func() { haDone <- node.run(haCtx) }()
+	}
+
+	select {
+	case sig := <-stop:
+		logger.Info("shutdown signal received", "signal", sig.String())
+	case err := <-serverErr:
 		logger.Error("server error", "error", err)
 		os.Exit(1)
+	case err := <-haDone:
+		// run only returns before shutdown if leadership or the etcd
+		// session was lost. Exit rather than demote in place; the
+		// supervisor restarts us and we rejoin as a fresh follower.
+		logger.Error("leader election failed, exiting", "error", err)
+		os.Exit(1)
+	}
+
+	if node != nil {
+		// Stop claiming first, then finish in-flight work, then resign —
+		// in that order, so the next leader never sees a job we're still
+		// running as orphaned unless the grace period runs out.
+		haCancel()
+		<-haDone
+		node.shutdown(10 * time.Second)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("server shutdown error", "error", err)
+	}
+	if scheduler != nil {
+		scheduler.Stop()
+		queue.Stop()
 	}
 
 	logger.Info("GoQueue stopped")

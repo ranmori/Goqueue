@@ -9,6 +9,30 @@ import (
 	"time"
 )
 
+// promQuote escapes a label value for the Prometheus text exposition
+// format: double-quoted string with \, ", and newlines backslash-escaped.
+// Unlike Go's %q, this avoids Go-specific escape sequences like \x or \u.
+func promQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range s {
+		switch c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteRune(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
 // Metrics is a small, dependency-free counter/histogram store that
 // renders in the standard Prometheus text exposition format.
 //
@@ -31,6 +55,7 @@ type Metrics struct {
 
 	queueDepthFn func() map[string]int
 	scheduledFn  func() int
+	leaderFn     func() bool
 }
 
 type metricKey struct {
@@ -59,6 +84,12 @@ func (m *Metrics) SetQueueDepthFunc(fn func() map[string]int) {
 
 func (m *Metrics) SetScheduledFunc(fn func() int) {
 	m.scheduledFn = fn
+}
+
+// SetLeaderFunc wires in leader-election state, exported as the
+// goqueue_is_leader gauge. Left unset in single-node mode.
+func (m *Metrics) SetLeaderFunc(fn func() bool) {
+	m.leaderFn = fn
 }
 
 // RecordCompletion should be called once per job, when it reaches a
@@ -107,7 +138,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return keys[i].status < keys[j].status
 	})
 	for _, k := range keys {
-		fmt.Fprintf(&b, "goqueue_jobs_total{type=%q,status=%q} %d\n", k.jobType, k.status, m.jobsTotal[k])
+		fmt.Fprintf(&b, "goqueue_jobs_total{type=%s,status=%s} %d\n", promQuote(k.jobType), promQuote(k.status), m.jobsTotal[k])
 	}
 
 	b.WriteString("# HELP goqueue_retries_total Total retry attempts, by job type.\n")
@@ -118,7 +149,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(types)
 	for _, t := range types {
-		fmt.Fprintf(&b, "goqueue_retries_total{type=%q} %d\n", t, m.retriesTotal[t])
+		fmt.Fprintf(&b, "goqueue_retries_total{type=%s} %d\n", promQuote(t), m.retriesTotal[t])
 	}
 
 	b.WriteString("# HELP goqueue_job_duration_seconds Job execution duration in seconds, by type.\n")
@@ -131,11 +162,11 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, t := range durTypes {
 		buckets := m.durationBuckets[t]
 		for i, le := range histogramBuckets {
-			fmt.Fprintf(&b, "goqueue_job_duration_seconds_bucket{type=%q,le=\"%g\"} %d\n", t, le, buckets[i])
+			fmt.Fprintf(&b, "goqueue_job_duration_seconds_bucket{type=%s,le=\"%g\"} %d\n", promQuote(t), le, buckets[i])
 		}
-		fmt.Fprintf(&b, "goqueue_job_duration_seconds_bucket{type=%q,le=\"+Inf\"} %d\n", t, m.durationCount[t])
-		fmt.Fprintf(&b, "goqueue_job_duration_seconds_sum{type=%q} %g\n", t, m.durationSum[t])
-		fmt.Fprintf(&b, "goqueue_job_duration_seconds_count{type=%q} %d\n", t, m.durationCount[t])
+		fmt.Fprintf(&b, "goqueue_job_duration_seconds_bucket{type=%s,le=\"+Inf\"} %d\n", promQuote(t), m.durationCount[t])
+		fmt.Fprintf(&b, "goqueue_job_duration_seconds_sum{type=%s} %g\n", promQuote(t), m.durationSum[t])
+		fmt.Fprintf(&b, "goqueue_job_duration_seconds_count{type=%s} %d\n", promQuote(t), m.durationCount[t])
 	}
 
 	if m.queueDepthFn != nil {
@@ -148,7 +179,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(lanes)
 		for _, lane := range lanes {
-			fmt.Fprintf(&b, "goqueue_queue_depth{priority=%q} %d\n", lane, depths[lane])
+			fmt.Fprintf(&b, "goqueue_queue_depth{priority=%s} %d\n", promQuote(lane), depths[lane])
 		}
 	}
 
@@ -156,6 +187,16 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.WriteString("# HELP goqueue_scheduled_jobs Jobs currently held by the scheduler awaiting their run_at.\n")
 		b.WriteString("# TYPE goqueue_scheduled_jobs gauge\n")
 		fmt.Fprintf(&b, "goqueue_scheduled_jobs %d\n", m.scheduledFn())
+	}
+
+	if m.leaderFn != nil {
+		b.WriteString("# HELP goqueue_is_leader 1 if this instance currently holds leadership, else 0.\n")
+		b.WriteString("# TYPE goqueue_is_leader gauge\n")
+		isLeader := 0
+		if m.leaderFn() {
+			isLeader = 1
+		}
+		fmt.Fprintf(&b, "goqueue_is_leader %d\n", isLeader)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
