@@ -411,7 +411,9 @@ TEST_DATABASE_URL="postgres://goqueue:goqueue@localhost:5432/goqueue_test?sslmod
   guaranteed globally unique across store swaps.
 - In HA mode, delivery is at-least-once (see
   [High availability](#high-availability-leader-election)). A requeued
-  job also starts its retry budget over.
+  job resumes its retry budget rather than restarting it, but the
+  attempt that was interrupted mid-flight is retried, so a handler can
+  see the same job twice.
 - In HA mode, deduplication is still per-instance memory. Two requests
   with the same `dedupe_key` that hit different instances are both
   accepted. Making it cluster-wide would need a unique constraint in

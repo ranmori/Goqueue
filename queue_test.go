@@ -545,3 +545,38 @@ func TestStoreDispatchStopHandsBackUnstartedJobs(t *testing.T) {
 		t.Fatalf("want job handed back as pending, got status %s", saved.Status)
 	}
 }
+
+func TestRequeuedJobResumesRetryBudget(t *testing.T) {
+	q := newTestQueue(t)
+
+	var calls atomic.Int32
+	q.RegisterHandler("flaky", func(ctx context.Context, job *Job) error {
+		calls.Add(1)
+		return errors.New("still failing")
+	})
+
+	// max_retries 2 means 3 attempts in total. This job carries one
+	// already-used attempt, as a job requeued by a new leader after a
+	// failover does, so only two attempts should be left — not three.
+	job := NewJob("flaky", nil, PriorityNormal, 2)
+	job.Retries = 1
+	if err := q.store.Save(job); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	q.processJob(job)
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("want 2 attempts left of a 3-attempt budget with 1 used, got %d", got)
+	}
+	if job.Status != StatusFailed {
+		t.Fatalf("want job failed after exhausting the budget, got %s", job.Status)
+	}
+	if job.Retries != 3 {
+		t.Fatalf("want 3 total attempts recorded, got %d", job.Retries)
+	}
+	entries, err := q.store.ListDeadLetters()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("want the job dead-lettered once, got %d (err %v)", len(entries), err)
+	}
+}

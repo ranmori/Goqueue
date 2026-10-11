@@ -415,7 +415,16 @@ func (q *Queue) processJob(job *Job) {
 		return
 	}
 
-	for attempt := 0; attempt <= job.MaxRetries; attempt++ {
+	// Resume from the attempts this job has already had rather than from
+	// zero. A job requeued by a new leader after a failover carries its
+	// count in the store, and restarting the budget each time leadership
+	// moved would let a poison job run far more than max_retries times.
+	firstAttempt := job.Retries
+	if firstAttempt < 0 {
+		firstAttempt = 0
+	}
+
+	for attempt := firstAttempt; attempt <= job.MaxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
 			q.log.Info("job retrying", "job_id", job.ID, "backoff", backoff, "attempt", attempt)
