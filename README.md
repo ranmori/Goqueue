@@ -1,5 +1,7 @@
 # GoQueue
 
+[![CI](https://github.com/ranmori/Goqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/ranmori/Goqueue/actions/workflows/ci.yml)
+
 A background job processor with a REST API, written in Go. Priority queues,
 retries with exponential backoff, delayed/scheduled jobs, per-job timeouts,
 a dead-letter queue with replay, per-type rate limiting, deduplication,
@@ -371,10 +373,16 @@ worker slot and a retry budget before being thrown away. Checking at
 
 ```bash
 go test ./... -v          # all tests
-go test ./... -race       # race detector (clean)
+go test ./... -race       # race detector
 gofmt -l .                # formatting
 go vet ./...              # static analysis
 ```
+
+Every push and pull request runs all of this on CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) under the race
+detector, in two jobs: build/vet/gofmt plus the unit tests, and then
+the full suite — nothing skipped — against a real 3-node etcd cluster
+and Postgres stood up from this repo's own `docker-compose.yml`.
 
 20 tests cover priority ordering, retry/backoff, timeout enforcement,
 delayed scheduling, rate limiting, deduplication (including window

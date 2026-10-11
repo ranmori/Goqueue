@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: build + unit tests (race detector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+
+      # The leader-election and fencing tests skip themselves without
+      # ETCD_ENDPOINTS / TEST_DATABASE_URL; the ha job below runs them.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  ha:
+    name: HA tests (3-node etcd + Postgres)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      # Uses the repo's own compose file, so CI also proves that file
+      # still stands a cluster up. --wait blocks on the healthchecks.
+      - name: Start etcd cluster and Postgres
+        run: docker compose up -d --wait etcd1 etcd2 etcd3 postgres
+
+      - name: Show etcd cluster membership
+        run: docker compose exec -T etcd1 etcdctl --endpoints=etcd1:2379,etcd2:2379,etcd3:2379 endpoint status -w table
+
+      # The fencing tests truncate jobs and leader_fence, so they get a
+      # database of their own rather than the one the app uses.
+      - name: Create scratch test database
+        run: docker compose exec -T postgres createdb -U goqueue goqueue_test
+
+      - name: go test -race (full suite, nothing skipped)
+        env:
+          ETCD_ENDPOINTS: 127.0.0.1:2379
+          TEST_DATABASE_URL: postgres://goqueue:goqueue@127.0.0.1:5432/goqueue_test?sslmode=disable
+        run: go test -race -count=1 -v ./...
+
+      - name: Infrastructure logs
+        if: failure()
+        run: docker compose logs --no-color --tail=100 etcd1 etcd2 etcd3 postgres
